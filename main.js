@@ -10,6 +10,30 @@ const xml2js        = require('xml2js')
 const path          = require('path')
 const fs            = require('fs')
 
+function loadEnv() {
+    const candidate = path.resolve(__dirname, '..', '.env')
+    const local = path.resolve(__dirname, '.env')
+    ;[candidate, local].forEach((file) => {
+        if (!fs.existsSync(file)) return
+        const content = fs.readFileSync(file, 'utf8')
+        content.split(/\r?\n/).forEach((line) => {
+            if (!line || !line.trim() || line.trim().startsWith('#')) return
+            const idx = line.indexOf('=')
+            if (idx === -1) return
+            const key = line.slice(0, idx).trim()
+            let value = line.slice(idx + 1).trim()
+            if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.slice(1, -1)
+            }
+            if (!process.env[key]) {
+                process.env[key] = value
+            }
+        })
+    })
+}
+
+loadEnv()
+
 // Прочитать содержимое файла с категориями
 const categoryList = JSON.parse(fs.readFileSync(path.join(__dirname, 'category.json'), 'utf-8'))
 
@@ -72,20 +96,44 @@ const createAxiosProxy = () => {
 const axiosProxy = createAxiosProxy()
 
 // Имя агента в заголовке запросов (вместо axios)
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0 Win64 x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
 const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0 Win64 x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': USER_AGENT
 }
 
-// Cookie для автроризации на сайте RuTracker (требуется для получения info hash списка файлов)
+const getEnvCookie = (...names) => {
+    for (const name of names) {
+        const value = process.env[name]
+        if (value && String(value).trim().length) {
+            return String(value).trim()
+        }
+    }
+    return ''
+}
+
+// Cookie for RuTracker authentication.
+// Expected env: RUTRACKER_COOKIE (e.g. "bb_session=...; bb_data=..." or just "bb_session=...")
+const RUTRACKER_COOKIE = getEnvCookie('RUTRACKER_COOKIE')
 const headers_RuTracker = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0 Win64 x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Cookie': 'bb_session=0-44590272-Sp8wQfjonpx37QjDuZUD'
+    'User-Agent': USER_AGENT,
+    ...(RUTRACKER_COOKIE ? { 'Cookie': RUTRACKER_COOKIE } : {})
 }
 
-// Cookie для автроризации на сайте Kinozal (требуется для получения info hash списка файлов)
+// Cookie for Kinozal authentication.
+// Expected env: KINOZAL_COOKIE (e.g. "uid=...; pass=...")
+const KINOZAL_COOKIE = getEnvCookie('KINOZAL_COOKIE') || ((process.env.KINOZAL_UID && process.env.KINOZAL_PASS) ? `uid=${process.env.KINOZAL_UID}; pass=${process.env.KINOZAL_PASS}` : '')
 const headers_Kinozal = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0 Win64 x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Cookie': 'uid=20631917; pass=KOJ4DJf1VS'
+    'User-Agent': USER_AGENT,
+    ...(KINOZAL_COOKIE ? { 'Cookie': KINOZAL_COOKIE } : {})
+}
+
+// Optional cookie for NoNameClub (nnmclub.to). Some endpoints work without it, but torrent file / file lists may require auth.
+// Expected env: NNMCLUB_COOKIE or NONAMECLUB_COOKIE
+const NNMCLUB_COOKIE = getEnvCookie('NNMCLUB_COOKIE', 'NONAMECLUB_COOKIE')
+const headers_NoNameClub = {
+    'User-Agent': USER_AGENT,
+    ...(NNMCLUB_COOKIE ? { 'Cookie': NNMCLUB_COOKIE } : {})
 }
 
 // Функция получения текущего времени для логирования
@@ -537,6 +585,35 @@ async function RuTrackerID(query) {
             Files: torrents
         }
     ]
+}
+
+// RuTracker Torrent file (requires auth cookies)
+async function RuTrackerTorrent(query) {
+    const url = `https://rutracker.org/forum/dl.php?t=${query}`
+    try {
+        const response = await axiosProxy.get(url, {
+            responseType: 'arraybuffer',
+            headers: headers_RuTracker,
+            maxRedirects: 0,
+            validateStatus: (status) => status >= 200 && status < 400
+        })
+        console.log(`${getCurrentTime()} [Request] ${url} (RuTracker Torrent)`) 
+
+        const contentType = String(response.headers?.['content-type'] || '')
+        const buf = Buffer.from(response.data)
+
+        // If rutracker returns an HTML page (login/cloudflare), WebTorrent will fail parsing with
+        // errors like "not a number: buffer[0] = 60" (60 is '<'). Detect and surface a readable error.
+        if (contentType.includes('text/html') || buf.slice(0, 1).toString('utf8') === '<') {
+            return { ok: false, error: 'RuTracker returned HTML instead of a .torrent file. Your cookie may be missing/expired (often requires cf_clearance + bb_session).' }
+        }
+
+        return { ok: true, data: buf }
+    } catch (error) {
+        const code = error && error.code ? error.code : 'UNKNOWN'
+        console.error(`${getCurrentTime()} [ERROR] RuTracker torrent download failed (Code: ${code})`)
+        return { ok: false, error: 'RuTracker torrent download failed' }
+    }
 }
 
 async function RuTrackerFilesPuppetter(query) {
@@ -1564,7 +1641,7 @@ async function NoNameClub(query, categoryId, page) {
     try {
         const response = await axiosProxy.get(url, {
             responseType: 'arraybuffer',
-            headers: headers
+            headers: headers_NoNameClub
         })
         // Декодируем HTML-страницу в кодировку win-1251
         html = iconv.decode(response.data, 'win1251')
@@ -1645,7 +1722,7 @@ async function NoNameClubID(query) {
     try {
         const response = await axiosProxy.get(url, {
             responseType: 'arraybuffer',
-            headers: headers
+            headers: headers_NoNameClub
         })
         html = iconv.decode(response.data, 'win1251')
         console.log(`${getCurrentTime()} [Request] ${url}`)
@@ -1790,7 +1867,7 @@ async function NoNameClubID(query) {
     try {
         const response = await axiosProxy.get(urlTorrentFiles, {
             responseType: 'arraybuffer',
-            headers: headers
+            headers: headers_NoNameClub
         })
         html = iconv.decode(response.data, 'win1251')
         console.log(`${getCurrentTime()} [Request] ${urlTorrentFiles}`)
@@ -1848,7 +1925,7 @@ async function NoNameClubRSS(typeData, categoryId) {
     try {
         const response = await axiosProxy.get(url, {
             responseType: 'arraybuffer',
-            headers: headers
+            headers: headers_NoNameClub
         })
         if (typeData === "json") {
             data = iconv.decode(response.data, 'win1251')
@@ -2289,7 +2366,7 @@ web.all('/:api?/:category?/:type?/:provider?', async (req, res) => {
         }
     }
     // Отвечаем, если 3-й параметр type не валидный, что бы пропустить к основным маршрутам
-    if (type !== "title" && type !== "id" && type !== "rss" && type !== "category") {
+    if (type !== "title" && type !== "id" && type !== "rss" && type !== "category" && type !== "torrent") {
         console.log(`${getCurrentTime()} [${req.method}] ${req.ip.replace('::ffff:', '')} (${req.headers['user-agent']}) [404] Endpoint not found. Endpoint: ${req.path}`)
         return res.status(404).send('Endpoint not found')
     }
@@ -2392,6 +2469,21 @@ web.all('/:api?/:category?/:type?/:provider?', async (req, res) => {
         } else {
             console.log(`${getCurrentTime()} [${req.method}] ${req.ip.replace('::ffff:', '')} (${req.headers['user-agent']}) [404] Provider ${provider} not found`)
             return res.status(404).send(`Provider ${provider} not found`)
+        }
+    }
+    // RuTracker Torrent file
+    else if (category === 'get' && type === 'torrent' && provider === 'rutracker') {
+        try {
+            const result = await RuTrackerTorrent(query)
+            if (!result.ok) {
+                return res.status(401).json({ Result: result.error })
+            }
+            res.set('Content-Type', 'application/x-bittorrent')
+            res.set('Content-Disposition', `attachment; filename="rutracker-${query}.torrent"`)
+            return res.send(result.data)
+        } catch (error) {
+            console.error("Error:", error)
+            return res.status(400).json({ Result: 'No data' })
         }
     }
     // RuTracker Title
@@ -2622,8 +2714,14 @@ module.exports = web
 
 // Запуск Express
 const port = argv.port
-const server = web.listen(port)
-console.log(`Server is running on port: ${port}`)
+const server = web.listen(port, () => {
+    console.log(`Server is running on port: ${port}`)
+})
+server.on('error', (error) => {
+    const code = error && error.code ? error.code : 'UNKNOWN'
+    console.error(`Server failed to start on port ${port} (Code: ${code})`)
+    process.exit(1)
+})
 
 // Локальное тестирование с последующим завершением
 function testRequest() {
