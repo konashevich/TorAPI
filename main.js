@@ -8,6 +8,7 @@ const proxy         = require('https-proxy-agent')
 const iconv         = require('iconv-lite')
 const xml2js        = require('xml2js')
 const path          = require('path')
+const https         = require('https')
 const fs            = require('fs')
 
 function loadEnv() {
@@ -119,6 +120,10 @@ const headers_RuTracker = {
     'User-Agent': USER_AGENT,
     ...(RUTRACKER_COOKIE ? { 'Cookie': RUTRACKER_COOKIE } : {})
 }
+
+// Persistent HTTPS agent for RuTracker: reuse TCP+TLS connections (avoids
+// Cloudflare stalling new handshakes) and force IPv4 (IPv6 is unreachable).
+const rutrackerAgent = new https.Agent({ keepAlive: true, family: 4 })
 
 // Cookie for Kinozal authentication.
 // Expected env: KINOZAL_COOKIE (e.g. "uid=...; pass=...")
@@ -287,9 +292,7 @@ async function RuTracker(query, categoryId, page) {
     const p = getPage(page)
     // Список все зеркальных URL провайдера для перебора в цикле в случае недоступности одного
     const urls = [
-        'https://rutracker.org',
-        'https://rutracker.net',
-        'https://rutracker.nl'
+        'https://rutracker.org'
     ]
     // Переменная для отслеживания успешного выполнения запроса
     let checkUrl = false
@@ -298,25 +301,35 @@ async function RuTracker(query, categoryId, page) {
     let url
     for (let i = 0; i < urls.length; i++) {
         url = urls[i]
-        urlQuery = `${urls[i]}/forum/tracker.php?nm=${query}&f=${categoryId}&start=${p}`
-        try {
-            const response = await axiosProxy.get(urlQuery, {
-                timeout: 3000,
-                responseType: 'arraybuffer',
-                headers: headers_RuTracker
-            })
-            // Декодируем HTML-страницу в кодировку win-1251
-            html = iconv.decode(response.data, 'win1251')
-            // Если удалось получить данные, фиксируем успух, логируем и выходим из цикла
-            checkUrl = true
-            console.log(`${getCurrentTime()} [Request] ${urlQuery}`)
-            break
-        } catch (error) {
-            console.error(`${getCurrentTime()} [ERROR] ${error.hostname} server is not available (Code: ${error.code})`)
+        const urlQuery = `${urls[i]}/forum/tracker.php?nm=${query}&f=${categoryId}&start=${p}`
+        // Retry up to 2 extra times on transient errors (ECONNABORTED, ETIMEDOUT, ECONNRESET)
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const response = await axiosProxy.get(urlQuery, {
+                    timeout: 30000,
+                    responseType: 'arraybuffer',
+                    headers: headers_RuTracker,
+                    httpsAgent: rutrackerAgent
+                })
+                html = iconv.decode(response.data, 'win1251')
+                checkUrl = true
+                console.log(`${getCurrentTime()} [Request] ${urlQuery}`)
+                break
+            } catch (error) {
+                const transient = !error.code || ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(error.code)
+                if (transient && attempt < 2) {
+                    console.log(`${getCurrentTime()} [RETRY] ${new URL(urlQuery).hostname} (${error.code}), attempt ${attempt + 2}/3`)
+                    continue
+                }
+                const hostname = new URL(urlQuery).hostname
+                console.error(`${getCurrentTime()} [ERROR] ${hostname} server is not available (Code: ${error.code})`)
+            }
         }
+        if (checkUrl) break
     }
     if (!checkUrl) {
-        return { 'Result': `Server is not available` }
+        const hint = RUTRACKER_COOKIE ? '' : ' (no auth cookie — try connecting to RuTracker first)'
+        return { 'Result': `Server is not available${hint}` }
     }
     const data = cheerio.load(html)
     data('table .forumline tbody tr').each((_, element) => {
